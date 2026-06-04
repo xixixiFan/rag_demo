@@ -29,3 +29,10 @@ Thumbs.db
 # 临时文件
 *.tmp
 *.temp
+
+# 向量数据库数据
+chroma_db/
+
+# 缓存
+.cache/
+*.cache
