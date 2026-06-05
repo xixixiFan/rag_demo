@@ -1,0 +1,153 @@
+// utils/traceNode.js
+// 节点追踪包装器 - 为每个 LangGraph 节点自动记录 Langfuse Span
+
+import langfuse from './langfuse.js';
+
+/**
+ * 包装节点函数，自动记录 Span（输入、输出、耗时、错误）
+ * @param {Function} nodeFn - 原始节点函数
+ * @param {string} nodeName - 节点名称（用于 Langfuse 显示）
+ * @returns {Function} 包装后的节点函数
+ */
+export function traceNode(nodeFn, nodeName) {
+    return async (state) => {
+        // 从 state 中获取 trace 引用（由 server.js 注入）
+        const trace = state.langfuseTrace;
+
+        if (!trace) {
+            // 如果没有 trace，直接执行原函数（降级处理）
+            console.log(`[traceNode] ${nodeName}: 无 trace，跳过记录`);
+            return await nodeFn(state);
+        }
+
+        // 创建 Span
+        const span = trace.span({
+            name: nodeName,
+            input: sanitizeInput(nodeName, state)
+        });
+
+        const startTime = Date.now();
+
+        try {
+            const result = await nodeFn(state);
+            const duration = Date.now() - startTime;
+
+            span.update({
+                output: sanitizeOutput(nodeName, result),
+                metadata: { duration, status: 'success' }
+            });
+
+            return result;
+        } catch (error) {
+            const duration = Date.now() - startTime;
+
+            span.update({
+                output: { error: error.message },
+                metadata: { duration, status: 'error' },
+                level: 'ERROR'
+            });
+            throw error;
+        }
+    };
+}
+
+/**
+ * 清理输入数据 - 移除敏感/过大的字段
+ */
+function sanitizeInput(nodeName, state) {
+    const base = {
+        query: state.query?.substring(0, 100),
+        retryCount: state.retryCount || 0
+    };
+
+    // 根据节点类型添加特定字段
+    if (nodeName === 'rewrite') {
+        return base;
+    }
+
+    if (nodeName === 'retrieve') {
+        return {
+            ...base,
+            currentRewrites: state.currentRewrites?.slice(0, 3)
+        };
+    }
+
+    if (nodeName === 'make_draft') {
+        return {
+            ...base,
+            retrievedContextsCount: state.retrievedContexts?.length || 0,
+            hasWebSearch: state.hasWebSearch || false
+        };
+    }
+
+    if (nodeName === 'check_quality') {
+        return {
+            ...base,
+            currentDraftPreview: state.currentDraft?.substring(0, 100)
+        };
+    }
+
+    if (nodeName === 'web_search') {
+        return {
+            ...base,
+            searchQuery: state.query?.substring(0, 100)
+        };
+    }
+
+    return base;
+}
+
+/**
+ * 清理输出数据 - 根据节点类型选择性保留字段
+ */
+export function sanitizeOutput(nodeName, result) {
+    if (nodeName === 'rewrite') {
+        return {
+            currentRewrites: result.currentRewrites,
+            agentHistory: result.agentHistory
+        };
+    }
+
+    if (nodeName === 'retrieve') {
+        return {
+            retrievedContextsCount: result.retrievedContexts?.length || 0,
+            agentHistory: result.agentHistory
+            // 不传具体内容，太大
+        };
+    }
+
+    if (nodeName === 'make_draft') {
+        return {
+            currentDraft: result.currentDraft?.substring(0, 500),
+            agentHistory: result.agentHistory
+        };
+    }
+
+    if (nodeName === 'check_quality') {
+        return {
+            reviewStatus: result.reviewStatus,
+            contextPrecision: result.contextPrecision,
+            reviewFeedback: result.reviewFeedback?.substring(0, 200),
+            issueType: result.issueType,
+            agentHistory: result.agentHistory
+        };
+    }
+
+    if (nodeName === 'web_search') {
+        return {
+            hasWebSearch: result.hasWebSearch,
+            webResultsCount: result.retrievedContexts?.length || 0,
+            agentHistory: result.agentHistory
+        };
+    }
+
+    if (nodeName === 'handle_retry') {
+        return {
+            retryCount: result.retryCount,
+            agentHistory: result.agentHistory
+        };
+    }
+
+    // 默认返回全部（安全节点）
+    return result;
+}

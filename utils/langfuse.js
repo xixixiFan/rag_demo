@@ -5,10 +5,9 @@ const langfuse = new Langfuse({
     publicKey: config.langfuse.publicKey,
     secretKey: config.langfuse.secretKey,
     baseUrl: config.langfuse.baseUrl,
-    requestTimeout: config.langfuse.timeout
+    requestTimeout: config.langfuse.timeout,
 });
 
-// 优雅关闭
 process.on('exit', () => {
     langfuse.shutdownAsync();
 });
