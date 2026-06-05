@@ -4,10 +4,14 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
+    "start": "node index.js",
     "test": "jest",
-    "start:chroma": "chroma run --path ./chroma_db --host localhost --port 8000",
-    "start:redis": "redis-server",
-    "setup:chroma": "pip install chromadb"
+    "start:server": "node r4_supervisor/server.js",
+    "start:chroma": "python start_chroma.py",
+    "start:redis": "D:\\APP\\Redis\\redis-server.exe",
+    "dev": "nodemon index.js",
+    "frontend:dev": "cd frontend && npm run dev",
+    "start:all": "npm run start:redis && npm run start:chroma && npm run start:server"
   },
   "keywords": [],
   "author": "",
