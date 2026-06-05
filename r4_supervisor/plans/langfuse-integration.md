@@ -156,66 +156,59 @@ fastify.post('/api/agent/chat', async (request, reply) => {
 
 ---
 
-### Phase 3: 节点级 Span 追踪 (预计 3 小时)
+### Phase 3: 节点级 Span 追踪 (已完成)
 
-#### 3.1 封装节点包装器
+**实现方式调整**：由于 LangGraph.js 的节点在编译时绑定，无法在运行时动态注入 trace 引用，因此改为在 SSE 流处理中记录节点 Span。
+
+#### 3.1 创建输出清理函数 ✅
 
 ```javascript
 // utils/traceNode.js
-import langfuse from './langfuse.js';
-
-export function traceNode(nodeFn, nodeName) {
-    return async (state) => {
-        // 创建 Span
-        const span = langfuse.span({
-            name: nodeName,
-            input: { state: sanitizeState(state) }
-        });
-
-        const startTime = Date.now();
-
-        try {
-            const result = await nodeFn(state);
-            const duration = Date.now() - startTime;
-
-            span.update({
-                output: sanitizeResult(result),
-                metadata: { duration }
-            });
-
-            return result;
-        } catch (error) {
-            span.update({
-                output: { error: error.message },
-                level: 'ERROR'
-            });
-            throw error;
-        }
-    };
-}
-
-// 清理敏感数据
-function sanitizeState(state) {
-    return {
-        query: state.query?.substring(0, 100),
-        retryCount: state.retryCount,
-        // 不传 retrievedContexts（太大）
-    };
+export function sanitizeOutput(nodeName, result) {
+    if (nodeName === 'rewrite') {
+        return {
+            currentRewrites: result.currentRewrites,
+            agentHistory: result.agentHistory
+        };
+    }
+    if (nodeName === 'retrieve') {
+        return {
+            retrievedContextsCount: result.retrievedContexts?.length || 0,
+            agentHistory: result.agentHistory
+        };
+    }
+    // ... 其他节点
 }
 ```
 
-#### 3.2 包装所有节点
+#### 3.2 在 server.js 中记录节点 Span ✅
 
 ```javascript
-// server.js
-import { traceNode } from './utils/traceNode.js';
-import { queryRewriteNode as rawRewrite } from './nodes/rewrite.js';
+// server.js - SSE 流处理中
+for await (const chunk of streamResult) {
+    const nodeName = Object.keys(chunk)[0];
+    const nodeUpdate = chunk[nodeName];
+    
+    // 直接使用 trace.span()，去掉 executionSpan 中间层
+    trace.span({
+        name: nodeName,
+        input: {
+            query: nodeUpdate.currentRewrites?.[0] || query,
+            retryCount: nodeUpdate.retryCount
+        },
+        output: sanitizeOutput(nodeName, nodeUpdate),
+        metadata: { duration: nodeDuration }
+    });
+}
+```
 
-const queryRewriteNode = traceNode(rawRewrite, 'query_rewrite');
-const retrieveAndRankNode = traceNode(rawRetrieve, 'retrieve_and_rank');
-const draftNode = traceNode(rawDraft, 'make_draft');
-const evaluateNode = traceNode(rawEvaluate, 'check_quality');
-const webSearchNode = traceNode(rawWebSearch, 'web_search');
+**Langfuse 结构**：
+```
+Trace: trace-xxx
+├── Span: rewrite (42ms)
+├── Span: retrieve (350ms)
+├── Span: make_draft (2100ms)
+└── Span: check_quality (1800ms)
 ```
 
 ---
@@ -413,15 +406,15 @@ Trace: vue_run_1780565418475
 
 ## 八、时间估算
 
-| Phase | 内容 | 预计时间 |
-|-------|------|---------|
-| 1 | 环境准备 | 30 分钟 |
-| 2 | 基础集成 | 2 小时 |
-| 3 | 节点级 Span | 3 小时 |
-| 4 | LLM Token 追踪 | 2 小时 |
-| 5 | 工具调用追踪 | 1 小时 |
-| 6 | 前端集成 | 2 小时 |
-| **总计** | | **约 10.5 小时** |
+| Phase | 内容 | 预计时间 | 状态 |
+|-------|------|---------|------|
+| 1 | 环境准备 | 30 分钟 | ✅ 完成 |
+| 2 | 基础集成 | 2 小时 | ✅ 完成 |
+| 3 | 节点级 Span | 3 小时 | ✅ 完成 |
+| 4 | LLM Token 追踪 | 2 小时 | ⏳ 待做 |
+| 5 | 工具调用追踪 | 1 小时 | ⏳ 待做 |
+| 6 | 前端集成 | 2 小时 | ⏳ 待做 |
+| **总计** | | **约 10.5 小时** | **已完成 5.5 小时** |
 
 ---
 
