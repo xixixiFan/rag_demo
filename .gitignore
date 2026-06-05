@@ -33,6 +33,25 @@ Thumbs.db
 # 向量数据库数据
 chroma_db/
 
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 模型缓存（HuggingFace）
+models/
+.transformers/
+
+# 数据文件
+*.db
+*.sqlite
+*.sqlite3
+
+# 备份文件
+*.bak
+*.swp
+*~
+
 # 缓存
 .cache/
 *.cache
