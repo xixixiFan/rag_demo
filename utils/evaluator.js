@@ -1,5 +1,4 @@
-import axios from 'axios';
-import config from '../config/index.js';
+import { chatClient } from '../config/chatClient.js';
 
 class RAGEvaluator {
     constructor() {
@@ -7,15 +6,12 @@ class RAGEvaluator {
             return RAGEvaluator.instance;
         }
 
-        const apiConfig = config.ai.deepseek;
-        this.apiKey = apiConfig.apiKey;
-        this.apiUrl = `${apiConfig.baseURL}/chat/completions`;
-        this.chatModel = apiConfig.chatModel;
-
         RAGEvaluator.instance = this;
     }
 
-    async evaluate(query, contexts, response, hasWebSearch = false) {
+    async evaluate(query, contexts, response, hasWebSearch = false, config = {}) {
+        const trace = config?.configurable?.langfuseTrace;
+
         // 基础校验：如果没有切片或回答为空，直接打回
         if (!contexts || contexts.length === 0 || !response) {
             return {
@@ -59,19 +55,18 @@ ${webSearchNote}
         const userContent = `【原始问题】: ${query}\n\n【检索上下文】:\n${contextStr}\n\n【生成答案】:\n${response}`;
 
         try {
-            const res = await axios.post(this.apiUrl, {
-                model: this.chatModel,
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: userContent }
-                ],
+            const message = await chatClient.create([
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userContent }
+            ], {
                 temperature: 0.1,
-                response_format: { type: "json_object" }
-            }, {
-                headers: { "Authorization": `Bearer ${this.apiKey}` }
+                response_format: { type: "json_object" },
+                trace,
+                name: 'evaluate_quality'
             });
 
-            const evalResult = JSON.parse(res.data.choices[0].message.content);
+            const content = typeof message === 'string' ? message : message.content;
+            const evalResult = JSON.parse(content);
 
             console.log(`\n===================  RAGAS 质量审计报告 ===================`);
             console.log(`忠实度 (Faithfulness)        : ${(evalResult.faithfulness * 100).toFixed(1)}%`);
@@ -80,7 +75,7 @@ ${webSearchNote}
             console.log(`纠错整改批注 (Feedback)      : "${evalResult.feedback}"`);
             console.log(`===========================================================`);
 
-            // evaluator 只负责返回分数和反馈，不决定流程状态
+            // evaluator 只负责评分，不决定流程状态
             return {
                 faithfulness: evalResult.faithfulness,
                 context_precision: evalResult.context_precision,

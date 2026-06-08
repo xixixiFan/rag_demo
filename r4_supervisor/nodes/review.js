@@ -3,7 +3,7 @@ import evaluator from "../../utils/evaluator.js";
 // 测试开关：强制返回 REJECT 来测试失败路径
 const USE_MOCK_EVALUATOR = false;
 
-export async function evaluateNode(state) {
+export async function evaluateNode(state, config) {
     console.log(`\n [Node: Evaluate] 正在质检当前回答草稿...`);
 
     const { query, retrievedContexts, currentDraft, hasWebSearch, retryCount } = state;
@@ -23,7 +23,7 @@ export async function evaluateNode(state) {
     }
 
     // 1. 调用 evaluator 获取评分（evaluator 只负责评分，不决定流程）
-    const evalResult = await evaluator.evaluate(query, retrievedContexts, currentDraft, hasWebSearch);
+    const evalResult = await evaluator.evaluate(query, retrievedContexts, currentDraft, hasWebSearch, config);
 
     const { faithfulness, context_precision, reason, feedback } = evalResult;
 

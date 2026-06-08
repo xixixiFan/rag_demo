@@ -17,7 +17,7 @@ export function traceNode(nodeFn, nodeName) {
 
         if (!trace) {
             // 如果没有 trace，直接执行原函数（降级处理）
-            return await nodeFn(state);
+            return await nodeFn(state, config);
         }
 
         // 创建 Span
@@ -29,8 +29,8 @@ export function traceNode(nodeFn, nodeName) {
         const startTime = Date.now();
 
         try {
-            // 调用原始节点函数（只传 state）
-            const result = await nodeFn(state);
+            // 调用原始节点函数（传入 state 和 config，让节点内部可以访问 trace）
+            const result = await nodeFn(state, config);
             const duration = Date.now() - startTime;
 
             span.update({

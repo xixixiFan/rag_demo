@@ -1,7 +1,7 @@
-// nodes/draft.js
+// nodes/make_draft.js
 import { chatClient } from "../../config/chatClient.js";
 
-export async function draftNode(state) {
+export async function draftNode(state, config) {
     console.log(`\n [Node: Draft] 正在根据问题和检索到的技术片段生成回答草稿...`);
 
     const hasWebSearch = state.hasWebSearch ?? false;
@@ -31,10 +31,17 @@ export async function draftNode(state) {
     }
 
     try {
+        // 从 config 获取 trace，传递给 chatClient 用于 Langfuse Generation 追踪
+        const trace = config?.configurable?.langfuseTrace;
+
         const responseText = await chatClient.create([
             { role: "system", content: systemPrompt },
             { role: "user", content: userContent }
-        ], { temperature: 0.3 });
+        ], {
+            temperature: 0.3,
+            trace,
+            name: 'make_draft'
+        });
 
         return {
             currentDraft: responseText,
@@ -42,7 +49,7 @@ export async function draftNode(state) {
         };
 
     } catch (err) {
-        console.error(" 大模型故障，降级返回旧内容:", err.message);
+        console.error("  大模型故障，降级返回旧内容:", err.message);
         const agentHistory = [...(state.agentHistory || []), "make_draft_error"];
         return {
             currentDraft: state.currentDraft || "大模型熔断故障。",
@@ -50,4 +57,3 @@ export async function draftNode(state) {
         };
     }
 }
-
