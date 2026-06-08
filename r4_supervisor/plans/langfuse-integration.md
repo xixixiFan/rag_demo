@@ -65,6 +65,21 @@
 
 **本计划采用**: **Langfuse Node.js SDK 手动埋点**
 
+### 2.3 Trace 传递方案对比
+
+| 方案 | 优点 | 缺点 | 结果 |
+|------|------|------|------|
+| **state.langfuseTrace** | 直观，符合 LangGraph 数据流 | 复杂对象被 LangGraph 过滤，始终为 null | ❌ 放弃 |
+| **config.configurable.langfuseTrace** | 绕过 state 序列化限制，保持 state 纯净 | 需要修改所有节点调用签名 | ✅ 采用 |
+
+### 2.4 代码组织方案对比
+
+| 方案 | 优点 | 缺点 | 结果 |
+|------|------|------|------|
+| **节点内埋点** | 简单直接 | 违反单一职责，每个节点都要重复追踪代码 | ❌ 放弃 |
+| **SSE 流中记录** | 集中管理 | 耦合度高，server.js 臃肿 | ❌ 放弃 |
+| **traceNode 包装器 (AOP)** | 业务逻辑纯净，自动追踪，可复用 | 需要额外的包装层 | ✅ 采用 |
+
 ---
 
 ## 三、实现步骤
@@ -156,60 +171,199 @@ fastify.post('/api/agent/chat', async (request, reply) => {
 
 ---
 
-### Phase 3: 节点级 Span 追踪 (已完成)
+### Phase 3: 节点级 Span 追踪 (已完成 - AOP 方案)
 
-**实现方式调整**：由于 LangGraph.js 的节点在编译时绑定，无法在运行时动态注入 trace 引用，因此改为在 SSE 流处理中记录节点 Span。
+**最终实现方案**：采用 AOP（面向切面编程）设计，使用 `traceNode` 包装器自动记录节点 Span。
 
-#### 3.1 创建输出清理函数 ✅
+---
+
+#### 遇到的问题与解决方案
+
+**问题 1: LangGraph 状态传递限制**
+
+最初尝试通过 `state.langfuseTrace` 传递 trace 对象，但发现 LangGraph 只会传递 `Annotation` 定义的字段。即使定义了：
+
+```javascript
+langfuseTrace: Annotation({
+    reducer: (x, y) => y,
+    default: () => null
+})
+```
+
+实际运行时 `state.langfuseTrace` 始终为 `null`。这是因为 LangGraph 的状态管理机只会序列化业务数据，不会传递复杂对象（如 Langfuse Trace 实例）。
+
+**尝试的解决方法**：
+1. 直接在 state 中添加字段 → 失败，复杂对象被过滤
+2. 在 SSE 流处理中通过 `trace.span()` 记录 → 可行，但耦合度高，违反单一职责原则
+
+**最终解决方案**：使用 LangGraph 的 `config.configurable` 机制传递 trace
+
+```javascript
+// server.js - 通过 config 传递 trace
+const streamResult = await graphApp.stream(
+    { query },
+    {
+        ...config,
+        streamMode: 'updates',
+        configurable: {
+            ...config.configurable,
+            langfuseTrace: trace  // ✅ trace 放在 configurable 中，不经过 state
+        }
+    }
+);
+```
+
+---
+
+**问题 2: 追踪代码侵入性**
+
+如果直接在节点函数中写入追踪逻辑：
+
+```javascript
+// ❌ 不好的设计 - 节点函数内部混入追踪逻辑
+export async function queryRewriteNode(state) {
+    const trace = state.langfuseTrace;  // 耦合
+    const span = trace.span(...);       // 业务逻辑被污染
+    // ... 业务代码
+}
+```
+
+这违反了单一职责原则，节点函数应该只关注业务逻辑。
+
+**最终解决方案**：AOP 风格的 `traceNode` 包装器
 
 ```javascript
 // utils/traceNode.js
-export function sanitizeOutput(nodeName, result) {
-    if (nodeName === 'rewrite') {
+export function traceNode(nodeFn, nodeName) {
+    return async (state, config) => {
+        const trace = config?.configurable?.langfuseTrace;
+        
+        if (!trace) {
+            return await nodeFn(state);  // 降级处理
+        }
+        
+        const span = trace.span({
+            name: nodeName,
+            input: sanitizeInput(nodeName, state)
+        });
+        
+        const startTime = Date.now();
+        try {
+            const result = await nodeFn(state);
+            const duration = Date.now() - startTime;
+            
+            span.update({
+                output: sanitizeOutput(nodeName, result),
+                metadata: { duration, status: 'success' }
+            });
+            
+            return result;
+        } catch (error) {
+            span.update({
+                output: { error: error.message },
+                metadata: { duration, status: 'error' },
+                level: 'ERROR'
+            });
+            throw error;
+        }
+    };
+}
+```
+
+节点函数保持纯净：
+
+```javascript
+// nodes/rewrite.js - 无感知，专注业务
+export async function queryRewriteNode(state) {
+    const rawQuery = state.query;
+    const rewrittenKeyword = await rewriteQuery(rawQuery, []);
+    return { 
+        currentRewrites: [rewrittenKeyword],
+        agentHistory: [...state.agentHistory, "rewrite"]
+    };
+}
+```
+
+server.js 中统一包装：
+
+```javascript
+// server.js
+import { traceNode } from "../utils/traceNode.js";
+
+const queryRewriteNode = traceNode(rawRewrite, 'rewrite');
+const retrieveAndRankNode = traceNode(rawRetrieve, 'retrieve');
+const draftNode = traceNode(rawDraft, 'make_draft');
+const check_quality = traceNode(rawEvaluate, 'check_quality');
+const handle_retry = traceNode(rawRetry, 'handle_retry');
+const webSearchNode = traceNode(rawWebSearch, 'web_search');
+```
+
+---
+
+#### 数据清理
+
+为避免上传敏感或过大数据，实现了 `sanitizeInput` 和 `sanitizeOutput` 函数：
+
+```javascript
+// utils/traceNode.js
+function sanitizeInput(nodeName, state) {
+    const base = {
+        query: state.query?.substring(0, 100),  // 只传前 100 字符
+        retryCount: state.retryCount || 0
+    };
+    
+    if (nodeName === 'retrieve') {
         return {
-            currentRewrites: result.currentRewrites,
-            agentHistory: result.agentHistory
+            ...base,
+            currentRewrites: state.currentRewrites?.slice(0, 3)
         };
     }
+    // ... 其他节点
+}
+
+function sanitizeOutput(nodeName, result) {
     if (nodeName === 'retrieve') {
         return {
             retrievedContextsCount: result.retrievedContexts?.length || 0,
             agentHistory: result.agentHistory
+            // ✅ 不传具体内容，太大
         };
     }
     // ... 其他节点
 }
 ```
 
-#### 3.2 在 server.js 中记录节点 Span ✅
+---
 
-```javascript
-// server.js - SSE 流处理中
-for await (const chunk of streamResult) {
-    const nodeName = Object.keys(chunk)[0];
-    const nodeUpdate = chunk[nodeName];
-    
-    // 直接使用 trace.span()，去掉 executionSpan 中间层
-    trace.span({
-        name: nodeName,
-        input: {
-            query: nodeUpdate.currentRewrites?.[0] || query,
-            retryCount: nodeUpdate.retryCount
-        },
-        output: sanitizeOutput(nodeName, nodeUpdate),
-        metadata: { duration: nodeDuration }
-    });
-}
+#### 最终效果
+
+**Langfuse Dashboard 结构**：
+```
+Trace: trace-1780887220928-1t0vmk
+├── Span: rewrite (894ms)
+│   ├── input: { query: "...", retryCount: 0 }
+│   └── output: { currentRewrites: [...], agentHistory: [...] }
+├── Span: retrieve (785ms)
+│   ├── input: { query: "...", currentRewrites: [...] }
+│   └── output: { retrievedContextsCount: 3, agentHistory: [...] }
+├── Span: make_draft (1149ms)
+│   └── ...
+├── Span: check_quality (1474ms)
+│   └── ...
+└── Span: web_search (5732ms)
+    └── ...
 ```
 
-**Langfuse 结构**：
-```
-Trace: trace-xxx
-├── Span: rewrite (42ms)
-├── Span: retrieve (350ms)
-├── Span: make_draft (2100ms)
-└── Span: check_quality (1800ms)
-```
+**验证截图**：2026-06-08 实际运行显示所有 5 个节点均成功记录，包含 input、output、duration、status。
+
+---
+
+#### 核心文件
+
+- `utils/traceNode.js` - AOP 包装器（新增）
+- `utils/langfuse.js` - Langfuse 客户端（Phase 2 已创建）
+- `r4_supervisor/server.js` - 集成包装器，通过 config 传递 trace
+- `r4_supervisor/state.js` - 移除 `langfuseTrace` 字段（纯净业务状态）
 
 ---
 
@@ -379,17 +533,30 @@ Trace: vue_run_1780565418475
 - ❌ 不要上传 API Key 等敏感信息
 - ✅ 只上传 `query` 前 100 字符
 - ✅ 只上传 `currentDraft` 前 500 字符
+- ✅ 使用 `sanitizeInput`/`sanitizeOutput` 统一清理
 
 ### 6.2 性能影响
 
 - Langfuse SDK 是**异步批量上报**，对性能影响很小
-- 但需要确保 `shutdownAsync()` 在进程退出时调用
+- `traceNode` 包装器只增加微秒级时间戳计算
+- 确保 `shutdownAsync()` 在进程退出时调用
 
-### 6.3 成本控制
+### 6.3 日志缓冲问题
+
+使用 `dotenvx run` 启动时，stdout 可能被缓冲，导致 console.log 不实时显示。
+
+**症状**：服务器运行正常，但看不到日志输出。
+
+**解决方案**：
+1. 使用 `LANGFUSE_DEBUG=true` 启用 SDK 调试日志
+2. 或在 Langfuse Dashboard 直接查看（最可靠）
+3. 或临时改用 `stderr` 输出：`console.error()`
+
+### 6.4 成本控制
 
 - Langfuse 云版免费额度：10,000 traces/月
 - 超出后按 $0.01/trace 计费
-- 可以考虑自托管
+- 可以考虑自托管（Docker / Kubernetes）
 
 ---
 
@@ -418,8 +585,66 @@ Trace: vue_run_1780565418475
 
 ---
 
-## 九、下一步
+## 十、技术决策记录 (ADR)
 
-1. **确认是否使用 Langfuse**（还是其他方案如 Phoenix、Arize）
-2. **注册账号获取凭证**
-3. **开始 Phase 1 环境准备**
+### ADR-001: 使用 config.configurable 传递 Langfuse Trace
+
+**状态**: 已采纳  
+**日期**: 2026-06-08
+
+**背景**: 最初尝试通过 `state.langfuseTrace` 传递 trace 对象，但 LangGraph 只传递 Annotation 定义的字段，复杂对象被过滤。
+
+**决策**: 使用 LangGraph 的 `config.configurable` 机制传递 trace 实例。
+
+**后果**:
+- ✅ state 保持纯净，只包含业务数据
+- ✅ trace 对象不被序列化，直接传递引用
+- ✅ 节点函数签名需支持 `(state, config)` 双参数
+
+### ADR-002: AOP 风格的 traceNode 包装器
+
+**状态**: 已采纳  
+**日期**: 2026-06-08
+
+**背景**: 直接在节点函数中写入追踪逻辑会违反单一职责原则，导致业务逻辑被污染。
+
+**决策**: 创建 `traceNode` 高阶函数，自动包装所有节点函数，统一处理：
+- Span 创建与更新
+- 输入/输出清理
+- 耗时计算
+- 错误捕获
+
+**后果**:
+- ✅ 节点函数专注业务逻辑
+- ✅ 追踪逻辑集中管理
+- ✅ 新增节点时只需包装即可自动获得追踪能力
+- ⚠️ 需要维护额外的工具文件
+
+### ADR-003: 数据清理策略
+
+**状态**: 已采纳  
+**日期**: 2026-06-08
+
+**背景**: Langfuse 按 trace 计费，上传过大数据会增加成本且无实际价值。
+
+**决策**: 实现 `sanitizeInput` 和 `sanitizeOutput` 函数：
+- `query` 只传前 100 字符
+- `currentDraft` 只传前 500 字符
+- `retrievedContexts` 只传数量，不传内容
+- 保留 `agentHistory` 用于链路追踪
+
+**后果**:
+- ✅ 减少数据传输成本
+- ✅ 避免敏感信息泄露
+- ✅ Langfuse Dashboard 保持简洁
+
+---
+
+## 十一、下一步
+
+1. **确认是否使用 Langfuse**（还是其他方案如 Phoenix、Arize）→ ✅ 已确认使用 Langfuse
+2. **注册账号获取凭证** → ✅ 已完成
+3. **开始 Phase 1 环境准备** → ✅ 已完成
+4. **Phase 4: LLM Token 追踪** → ⏳ 待做
+5. **Phase 5: 工具调用追踪** → ⏳ 待做
+6. **Phase 6: 前端集成** → ⏳ 待做
