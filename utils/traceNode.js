@@ -1,7 +1,6 @@
 // utils/traceNode.js
 // 节点追踪包装器 - 为每个 LangGraph 节点自动记录 Langfuse Span
-
-import langfuse from './langfuse.js';
+// AOP 设计：业务节点函数无感知，由包装器自动注入追踪逻辑
 
 /**
  * 包装节点函数，自动记录 Span（输入、输出、耗时、错误）

@@ -3,17 +3,28 @@ import cors from '@fastify/cors';
 import { StateGraph, END, START, MemorySaver } from "@langchain/langgraph";
 import { RAGGraphState } from "./state.js";
 
-// 导入节点
-import { queryRewriteNode } from "./nodes/rewrite.js";
-import { retrieveAndRankNode } from "./nodes/retrieve.js";
-import { draftNode } from "./nodes/make_draft.js";
-import { incrementRetryNode } from "./nodes/handle_retry.js";
-import { evaluateNode as check_quality } from "./nodes/review.js";
-import { webSearchNode } from "./nodes/web_search.js";
+// 导入原始节点函数（重命名）
+import { queryRewriteNode as rawRewrite } from "./nodes/rewrite.js";
+import { retrieveAndRankNode as rawRetrieve } from "./nodes/retrieve.js";
+import { draftNode as rawDraft } from "./nodes/make_draft.js";
+import { incrementRetryNode as rawRetry } from "./nodes/handle_retry.js";
+import { evaluateNode as rawEvaluate } from "./nodes/review.js";
+import { webSearchNode as rawWebSearch } from "./nodes/web_search.js";
 import { supervisorNode } from "./nodes/supervisor.js";
 
 // 导入 Langfuse 可观测性客户端
 import langfuse from "../utils/langfuse.js";
+// 导入节点追踪包装器（AOP 切面）
+import { traceNode } from "../utils/traceNode.js";
+
+// 使用 traceNode 包装器包装所有节点（AOP 风格）
+// 节点函数内部无感知，由包装器自动记录 Span
+const queryRewriteNode = traceNode(rawRewrite, 'rewrite');
+const retrieveAndRankNode = traceNode(rawRetrieve, 'retrieve');
+const draftNode = traceNode(rawDraft, 'make_draft');
+const check_quality = traceNode(rawEvaluate, 'check_quality');
+const handle_retry = traceNode(rawRetry, 'handle_retry');
+const webSearchNode = traceNode(rawWebSearch, 'web_search');
 
 // 初始化 Fastify
 const fastify = Fastify({ logger: false });
@@ -81,7 +92,7 @@ fastify.post('/api/agent/chat', async (request, reply) => {
     });
 
     console.log(`[Langfuse] Trace 创建：${traceId}, sessionId=${sessionId}`);
-    console.log(`\n 收到请求：query=${query?.substring(0, 50)}..., threadId=${threadId}`);
+    console.log(`\n📩 收到请求：query=${query?.substring(0, 50)}..., threadId=${threadId}`);
     console.log(`   └─ Langfuse Trace: ${traceId}`);
 
     if (!query) {
@@ -115,12 +126,13 @@ fastify.post('/api/agent/chat', async (request, reply) => {
     };
 
     try {
-        // 使用 graphApp.stream 进行异步流式输出(LangGraph.js 使用 stream 而非 astream)
+        // 使用 graphApp.stream 进行异步流式输出 (LangGraph.js 使用 stream 而非 astream)
         // streamMode: 'updates' 返回每个节点的增量更新，格式：{ [节点名]: { 节点输出 } }
+        // 注入 langfuseTrace 到 state，让节点内部的包装器可以访问
         const streamResult = await graphApp.stream(
             {
                 query,
-                _traceContext: trace
+                langfuseTrace: trace
             },
             {
                 ...config,
@@ -128,48 +140,18 @@ fastify.post('/api/agent/chat', async (request, reply) => {
             }
         );
 
-        const nodeStartTimes = new Map();
         const nodeOutputs = [];
-
-        const activeSpans = new Map();
 
         for await (const chunk of streamResult) {
             // chunk 格式：{ 节点名称：{ 该节点的输出字段 } }
             const nodeName = Object.keys(chunk)[0];
             const nodeUpdate = chunk[nodeName];
-            const currentTime = Date.now();
 
-            // 跳过 supervisor 路由决策节点
-            if (nodeName === 'supervisor') {
-                // 如果 supervisor 更新了状态，它会顺便把 _traceContext继续往下传
-                continue;
-            }
+            // 跳过 supervisor 节点，它只是路由决策，不是实际工作节点
+            if (nodeName === 'supervisor') continue;
 
-            // 【由于 updates 模式是在节点“结束”时才吐出 chunk，我们需要更精准的耗时与打点逻辑】
-            // 如果你在节点内部通过中间件或在外部拦截，这是标准做法。
-            // 在 server.js 层面，我们在此处对 Langfuse 进行最终的 Span 闭合上报：
-            console.log(`[SSE] 收到节点完成事件：${nodeName}`, nodeUpdate);
-
-            // 从节点更新中提取它内部上报或由我们计算的耗时
-            if (!nodeStartTimes.has(nodeName)) {
-                nodeStartTimes.set(nodeName, currentTime);
-            }
-            const nodeStartTime = nodeStartTimes.get(nodeName);
-            const nodeDuration = currentTime - nodeStartTime;
-
-            // 记录节点 Span
-            trace.span({
-                name: nodeName,
-                input: {
-                    query: nodeUpdate.currentRewrites?.[0] || query,
-                    retryCount: nodeUpdate.retryCount
-                },
-                output: sanitizeOutput(nodeName, nodeUpdate),
-                metadata: {
-                    duration: nodeDuration,
-                    hasWebSearch: nodeUpdate.hasWebSearch
-                }
-            });
+            console.log(`[SSE] 推送节点：${nodeName}`, nodeUpdate);
+            nodeOutputs.push(nodeName);
 
             // 构造推送到 Vue 3 前端的数据包
             const chunkData = {
@@ -189,10 +171,6 @@ fastify.post('/api/agent/chat', async (request, reply) => {
             if (typeof reply.raw.flush === 'function') {
                 reply.raw.flush();
             }
-
-            // 更新下一次节点预测的起始时间戳
-            nodeStartTimes.set(nodeName, Date.now());
-            nodeOutputs.push({ node: nodeName, duration: nodeDuration });
         }
 
         // 当异步迭代器执行完毕，说明整个图已经顺利走到了 END 节点
@@ -204,12 +182,22 @@ fastify.post('/api/agent/chat', async (request, reply) => {
             metadata: { threadId: config.configurable.thread_id }
         });
 
+        // 强制刷新到 Langfuse 云端
+        console.log('[Langfuse] 准备刷新到云端...');
+        await langfuse.flushAsync();
+        console.log('[Langfuse] 刷新完成');
+
     } catch (error) {
         console.error('[SSE] 错误:', error.message);
         trace.update({
             output: { error: error.message },
             level: 'ERROR'
         });
+
+        // 强制刷新错误到 Langfuse
+        console.log('[Langfuse] 准备刷新错误到云端...');
+        await langfuse.flushAsync();
+        console.log('[Langfuse] 错误刷新完成');
 
         // 向前端推送错误事件，避免前端一直卡在 loading 状态
         reply.raw.write(`data: ${JSON.stringify({ event: 'error', message: error.message })}\n\n`);
