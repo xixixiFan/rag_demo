@@ -9,13 +9,14 @@
  * @returns {Function} 包装后的节点函数
  */
 export function traceNode(nodeFn, nodeName) {
-    return async (state) => {
-        // 从 state 中获取 trace 引用（由 server.js 注入）
-        const trace = state.langfuseTrace;
+    return async (state, config) => {
+        // 从 config.configurable 获取 trace（LangGraph 通过 config 传递）
+        const trace = config?.configurable?.langfuseTrace;
+
+        console.log(`[traceNode] ${nodeName}: trace = ${trace ? '存在' : 'null'}`);
 
         if (!trace) {
             // 如果没有 trace，直接执行原函数（降级处理）
-            console.log(`[traceNode] ${nodeName}: 无 trace，跳过记录`);
             return await nodeFn(state);
         }
 
@@ -28,6 +29,7 @@ export function traceNode(nodeFn, nodeName) {
         const startTime = Date.now();
 
         try {
+            // 调用原始节点函数（只传 state）
             const result = await nodeFn(state);
             const duration = Date.now() - startTime;
 
@@ -100,50 +102,53 @@ function sanitizeInput(nodeName, state) {
  * 清理输出数据 - 根据节点类型选择性保留字段
  */
 export function sanitizeOutput(nodeName, result) {
+    const base = {
+        agentHistory: result.agentHistory
+    };
+
     if (nodeName === 'rewrite') {
         return {
-            currentRewrites: result.currentRewrites,
-            agentHistory: result.agentHistory
+            ...base,
+            currentRewrites: result.currentRewrites
         };
     }
 
     if (nodeName === 'retrieve') {
         return {
-            retrievedContextsCount: result.retrievedContexts?.length || 0,
-            agentHistory: result.agentHistory
-            // 不传具体内容，太大
+            ...base,
+            retrievedContextsCount: result.retrievedContexts?.length || 0
         };
     }
 
     if (nodeName === 'make_draft') {
         return {
-            currentDraft: result.currentDraft?.substring(0, 500),
-            agentHistory: result.agentHistory
+            ...base,
+            currentDraft: result.currentDraft?.substring(0, 500)
         };
     }
 
     if (nodeName === 'check_quality') {
         return {
+            ...base,
             reviewStatus: result.reviewStatus,
             contextPrecision: result.contextPrecision,
             reviewFeedback: result.reviewFeedback?.substring(0, 200),
-            issueType: result.issueType,
-            agentHistory: result.agentHistory
+            issueType: result.issueType
         };
     }
 
     if (nodeName === 'web_search') {
         return {
+            ...base,
             hasWebSearch: result.hasWebSearch,
-            webResultsCount: result.retrievedContexts?.length || 0,
-            agentHistory: result.agentHistory
+            webResultsCount: result.retrievedContexts?.length || 0
         };
     }
 
     if (nodeName === 'handle_retry') {
         return {
-            retryCount: result.retryCount,
-            agentHistory: result.agentHistory
+            ...base,
+            retryCount: result.retryCount
         };
     }
 

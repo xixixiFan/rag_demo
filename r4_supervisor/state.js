@@ -45,8 +45,5 @@ export const RAGGraphState = Annotation.Root({
         default: () => []
     }),
     finalAnswer: Annotation(),
-    failureReason: Annotation(),
-
-    // Langfuse: 用于在节点间流转的 Langfuse 追踪上下文
-    langfuseTrace: { value: null }
+    failureReason: Annotation()
 });

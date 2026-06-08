@@ -44,7 +44,7 @@ const workflow = new StateGraph(RAGGraphState)
     .addNode("retrieve", retrieveAndRankNode)
     .addNode("make_draft", draftNode)
     .addNode("check_quality", check_quality)
-    .addNode("handle_retry", incrementRetryNode)
+    .addNode("handle_retry", handle_retry)
     .addNode("web_search", webSearchNode)
 
     // 2. 定义边：Supervisor 是中央调度者，其他节点都要把结果返回给 Supervisor，由 Supervisor 决定下一步派发给哪个节点继续处理
@@ -128,15 +128,16 @@ fastify.post('/api/agent/chat', async (request, reply) => {
     try {
         // 使用 graphApp.stream 进行异步流式输出 (LangGraph.js 使用 stream 而非 astream)
         // streamMode: 'updates' 返回每个节点的增量更新，格式：{ [节点名]: { 节点输出 } }
-        // 注入 langfuseTrace 到 state，让节点内部的包装器可以访问
+        // 通过 config.configurable 传递 langfuseTrace，让节点内部的包装器可以访问
         const streamResult = await graphApp.stream(
-            {
-                query,
-                langfuseTrace: trace
-            },
+            { query },  // state 只包含业务数据
             {
                 ...config,
-                streamMode: 'updates'
+                streamMode: 'updates',
+                configurable: {
+                    ...config.configurable,
+                    langfuseTrace: trace  // 通过 config 传递 trace
+                }
             }
         );
 
