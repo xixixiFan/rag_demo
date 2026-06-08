@@ -367,47 +367,200 @@ Trace: trace-1780887220928-1t0vmk
 
 ---
 
-### Phase 4: LLM Token 追踪 (预计 2 小时)
+### Phase 4: LLM Token 追踪 (已完成)
 
-#### 4.1 修改 chatClient
+**实现思路**：
+1. 所有 LLM 调用统一通过 `chatClient.create()`，消除重复代码
+2. `chatClient` 内部自动创建 Langfuse Generation，记录 token 信息
+3. 通过 `config.configurable.langfuseTrace` 传递 trace，与 traceNode 设计一致
+
+---
+
+#### 4.1 改造 chatClient (核心)
 
 ```javascript
 // config/chatClient.js
 import langfuse from '../utils/langfuse.js';
 
-export class ChatClient {
+class ChatClient {
     async create(messages, options = {}) {
-        const generation = langfuse.generation({
-            name: 'deepseek_chat',
+        const { trace, name = 'deepseek_chat', ...apiOptions } = options;
+
+        // 创建 Langfuse Generation（如果有 trace）
+        const generation = trace ? langfuse.generation({
+            name,
             input: messages,
-            model: 'deepseek-chat',
-            modelParameters: { temperature: options.temperature || 0.3 }
-        });
+            model: apiOptions.model || config.ai.deepseek.chatModel,
+            modelParameters: { temperature: apiOptions.temperature ?? 0.1 }
+        }) : null;
 
         try {
-            const response = await axios.post(...);
-            
-            // 记录 Token 使用
-            generation.update({
-                output: response.data.choices[0].message.content,
-                usage: {
-                    promptTokens: response.data.usage.prompt_tokens,
-                    completionTokens: response.data.usage.completion_tokens,
-                    totalTokens: response.data.usage.total_tokens
-                }
-            });
+            const response = await this.client.post("/chat/completions", { ... });
+            const message = response.data.choices[0].message;
+            const usage = response.data.usage;
 
-            return response.data.choices[0].message.content;
-        } catch (error) {
-            generation.update({
-                output: { error: error.message },
-                level: 'ERROR'
-            });
-            throw error;
+            // 记录 Token 使用到 Langfuse
+            if (generation && usage) {
+                generation.update({
+                    output: message,
+                    usage: {
+                        promptTokens: usage.prompt_tokens,
+                        completionTokens: usage.completion_tokens,
+                        totalTokens: usage.total_tokens
+                    },
+                    metadata: {
+                        model: apiOptions.model || apiConfig.chatModel,
+                        temperature: apiOptions.temperature ?? 0.1
+                    }
+                });
+            }
+
+            return message.content.trim();
+        } catch (err) {
+            // 记录错误到 Langfuse
+            if (generation) {
+                generation.update({
+                    output: { error: err.message },
+                    level: 'ERROR'
+                });
+            }
+            throw err;
         }
     }
 }
 ```
+
+---
+
+#### 4.2 重构 LLM 调用点
+
+**rewriteQuery** (utils/query_rewrite.js):
+```javascript
+export async function rewriteQuery(query, chatHistory = [], config = {}) {
+    const trace = config?.configurable?.langfuseTrace;
+
+    const message = await chatClient.create([
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent }
+    ], {
+        temperature: 0.3,
+        max_tokens: 100,
+        trace,
+        name: 'rewrite_query'
+    });
+
+    return message.content?.trim() || message;
+}
+```
+
+**evaluator** (utils/evaluator.js):
+```javascript
+async evaluate(query, contexts, response, hasWebSearch = false, config = {}) {
+    const trace = config?.configurable?.langfuseTrace;
+
+    const message = await chatClient.create([
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent }
+    ], {
+        temperature: 0.1,
+        response_format: { type: "json_object" },
+        trace,
+        name: 'evaluate_quality'
+    });
+
+    return JSON.parse(message.content);
+}
+```
+
+---
+
+#### 4.3 修改节点函数传递 config
+
+**traceNode 包装器** - 现在传递 config 给节点函数：
+```javascript
+// utils/traceNode.js
+export function traceNode(nodeFn, nodeName) {
+    return async (state, config) => {
+        const trace = config?.configurable?.langfuseTrace;
+        // ...
+        // 调用原始节点函数（传入 state 和 config）
+        const result = await nodeFn(state, config);
+        // ...
+    };
+}
+```
+
+**make_draft** - 传递 trace 给 chatClient：
+```javascript
+// r4_supervisor/nodes/make_draft.js
+export async function draftNode(state, config) {
+    const trace = config?.configurable?.langfuseTrace;
+
+    const responseText = await chatClient.create([
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent }
+    ], {
+        temperature: 0.3,
+        trace,
+        name: 'make_draft'
+    });
+
+    return { currentDraft: responseText, ... };
+}
+```
+
+**rewrite** - 传递 config 给 rewriteQuery：
+```javascript
+// r4_supervisor/nodes/rewrite.js
+export async function queryRewriteNode(state, config) {
+    const rewrittenKeyword = await rewriteQuery(rawQuery, [], config);
+    return { currentRewrites: [rewrittenKeyword], ... };
+}
+```
+
+**review** - 传递 config 给 evaluator：
+```javascript
+// r4_supervisor/nodes/review.js
+export async function evaluateNode(state, config) {
+    const evalResult = await evaluator.evaluate(
+        query, retrievedContexts, currentDraft, hasWebSearch, config
+    );
+    // ...
+}
+```
+
+---
+
+#### 4.4 Langfuse Generation 结构
+
+```
+Trace: trace-xxx
+├── Generation: rewrite_query
+│   ├── Input: [system prompt, user query]
+│   ├── Output: "改写后的关键词"
+│   ├── Model: deepseek-chat
+│   └── Usage: prompt=50, completion=20, total=70
+├── Generation: make_draft
+│   ├── Input: [system prompt, user query, contexts]
+│   ├── Output: "回答草稿"
+│   └── Usage: prompt=500, completion=300, total=800
+└── Generation: evaluate_quality
+    ├── Input: [system prompt, query, contexts, response]
+    ├── Output: {"faithfulness": 0.9, "context_precision": 0.8, ...}
+    └── Usage: prompt=400, completion=50, total=450
+```
+
+---
+
+#### 4.5 核心文件
+
+- `config/chatClient.js` - 统一 LLM 调用入口，集成 Langfuse Generation
+- `utils/query_rewrite.js` - 重构为使用 chatClient
+- `utils/evaluator.js` - 重构为使用 chatClient
+- `utils/traceNode.js` - 修改为传递 config 给节点函数
+- `r4_supervisor/nodes/make_draft.js` - 传递 trace 给 chatClient
+- `r4_supervisor/nodes/rewrite.js` - 传递 config 给 rewriteQuery
+- `r4_supervisor/nodes/review.js` - 传递 config 给 evaluator
 
 ---
 
@@ -562,12 +715,12 @@ Trace: vue_run_1780565418475
 
 ## 七、验收标准
 
-- [ ] Langfuse Dashboard 能看到每条对话的 Trace
-- [ ] 每个节点的耗时都能在 Span 中看到
-- [ ] LLM 调用的 Token 数准确记录
-- [ ] 外网搜索调用有独立的 Span
-- [ ] 错误能正确标记为 `level: ERROR`
-- [ ] 进程退出时 SDK 正常关闭
+- [x] Langfuse Dashboard 能看到每条对话的 Trace
+- [x] 每个节点的耗时都能在 Span 中看到
+- [x] LLM 调用的 Token 数准确记录
+- [ ] 外网搜索调用有独立的 Span（Phase 5）
+- [x] 错误能正确标记为 `level: ERROR`
+- [x] 进程退出时 SDK 正常关闭
 
 ---
 
@@ -578,10 +731,10 @@ Trace: vue_run_1780565418475
 | 1 | 环境准备 | 30 分钟 | ✅ 完成 |
 | 2 | 基础集成 | 2 小时 | ✅ 完成 |
 | 3 | 节点级 Span | 3 小时 | ✅ 完成 |
-| 4 | LLM Token 追踪 | 2 小时 | ⏳ 待做 |
+| 4 | LLM Token 追踪 | 2 小时 | ✅ 完成 |
 | 5 | 工具调用追踪 | 1 小时 | ⏳ 待做 |
 | 6 | 前端集成 | 2 小时 | ⏳ 待做 |
-| **总计** | | **约 10.5 小时** | **已完成 5.5 小时** |
+| **总计** | | **约 10.5 小时** | **已完成 7.5 小时** |
 
 ---
 
@@ -645,6 +798,7 @@ Trace: vue_run_1780565418475
 1. **确认是否使用 Langfuse**（还是其他方案如 Phoenix、Arize）→ ✅ 已确认使用 Langfuse
 2. **注册账号获取凭证** → ✅ 已完成
 3. **开始 Phase 1 环境准备** → ✅ 已完成
-4. **Phase 4: LLM Token 追踪** → ⏳ 待做
-5. **Phase 5: 工具调用追踪** → ⏳ 待做
-6. **Phase 6: 前端集成** → ⏳ 待做
+4. **Phase 3: 节点级 Span 追踪** → ✅ 已完成（AOP 方案）
+5. **Phase 4: LLM Token 追踪** → ✅ 已完成（统一 chatClient）
+6. **Phase 5: 工具调用追踪** → ⏳ 待做（Tavily 搜索）
+7. **Phase 6: 前端集成** → ⏳ 待做（用户交互事件）
